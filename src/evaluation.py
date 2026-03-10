@@ -1,5 +1,9 @@
 """
-Evaluation utilities: accuracy, profit, Sharpe ratio, and comparison reports.
+Evaluation utilities matching the course methodology:
+- Profit: sum of (prediction * next_period_return) per quarter
+- Portfolio tracking: x[i+1] = x[i] + (x[i] / num_stocks) * profit_i
+- Sharpe ratio from quarterly portfolio returns
+- Classification accuracy
 """
 
 import numpy as np
@@ -9,72 +13,50 @@ from sklearn.metrics import classification_report, confusion_matrix
 
 def accuracy_metrics(y_true, y_pred):
     """Standard classification metrics."""
-    report = classification_report(y_true, y_pred, target_names=["-1 (miss)", "0 (neutral)", "+1 (beat)"], output_dict=True)
+    report = classification_report(
+        y_true, y_pred,
+        target_names=["-1 (miss)", "0 (neutral)", "+1 (beat)"],
+        output_dict=True,
+        zero_division=0,
+    )
     cm = confusion_matrix(y_true, y_pred, labels=[-1, 0, 1])
     return {"report": report, "confusion_matrix": cm}
 
 
-def portfolio_profit(y_pred, excess_ret, qtr_labels):
+def compute_portfolio_value(quarterly_results):
     """
-    Simulate a long-short portfolio:
-    - Go long stocks predicted +1
-    - Go short stocks predicted -1
-    - Ignore stocks predicted 0
-    Returns quarterly returns and total compounded return.
+    Compute cumulative portfolio value from quarterly predictions,
+    matching the course formula:
+        profit_i = (preds * next_period_return).sum()
+        x[i+1] = x[i] + (x[i] / num_stocks) * profit_i
+
+    quarterly_results: list of dicts with keys 'preds', 'returns', 'qtr'
+    Returns list of portfolio values starting at 1.0
     """
-    df = pd.DataFrame({
-        "pred": y_pred,
-        "excess_ret": excess_ret,
-        "qtr": qtr_labels,
-    })
+    x = [1.0]
+    qtr_profits = []
+    for qr in quarterly_results:
+        preds = qr["preds"]
+        returns = qr["returns"]
+        num_stocks = len(preds)
 
-    qtr_rets = []
-    for qtr, grp in df.groupby("qtr"):
-        longs = grp[grp["pred"] == 1]["excess_ret"]
-        shorts = grp[grp["pred"] == -1]["excess_ret"]
+        profit_i = (preds * returns).sum()
+        qtr_profits.append({"qtr": qr["qtr"], "profit": profit_i, "num_stocks": num_stocks})
 
-        ret = 0.0
-        n = 0
-        if len(longs) > 0:
-            ret += longs.mean()
-            n += 1
-        if len(shorts) > 0:
-            ret -= shorts.mean()
-            n += 1
-        if n > 0:
-            qtr_rets.append({"qtr": qtr, "return": ret / n})
+        x.append(x[-1] + (x[-1] / num_stocks) * profit_i)
 
-    qtr_df = pd.DataFrame(qtr_rets).sort_values("qtr")
-    total_return = (1 + qtr_df["return"]).prod() - 1
-    return {"quarterly_returns": qtr_df, "total_return": total_return}
+    return x, pd.DataFrame(qtr_profits)
 
 
-def sharpe_ratio(quarterly_returns: pd.Series, annualize: bool = True) -> float:
-    """Compute Sharpe ratio from a series of quarterly returns."""
-    if len(quarterly_returns) < 2:
+def sharpe_ratio(portfolio_values, annualize=True):
+    """Compute Sharpe ratio from portfolio value series."""
+    x = np.array(portfolio_values)
+    if len(x) < 3:
         return 0.0
-    mean = quarterly_returns.mean()
-    std = quarterly_returns.std()
-    sharpe = mean / (std + 1e-8)
+    returns = np.diff(x) / x[:-1]
+    mean_ret = returns.mean()
+    std_ret = returns.std()
+    sharpe = mean_ret / (std_ret + 1e-8)
     if annualize:
-        sharpe *= np.sqrt(4)  # annualize from quarterly
+        sharpe *= np.sqrt(4)  # quarterly -> annual
     return sharpe
-
-
-def full_evaluation(model_name, y_true, y_pred, excess_ret, qtr_labels):
-    """Run all evaluations and return a summary dict."""
-    acc = accuracy_metrics(y_true, y_pred)
-    profit = portfolio_profit(y_pred, excess_ret, qtr_labels)
-    sharpe = sharpe_ratio(profit["quarterly_returns"]["return"])
-
-    overall_acc = (y_true == y_pred).mean()
-
-    return {
-        "model": model_name,
-        "accuracy": overall_acc,
-        "total_profit": profit["total_return"],
-        "sharpe_ratio": sharpe,
-        "classification_report": acc["report"],
-        "confusion_matrix": acc["confusion_matrix"],
-        "quarterly_returns": profit["quarterly_returns"],
-    }

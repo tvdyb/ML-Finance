@@ -1,5 +1,8 @@
 """
-Main pipeline: prepare data, train all three models, evaluate, and save results.
+Main pipeline using rolling window train/test splits (course methodology):
+- Train on 20 quarters (5 years), test on the next quarter
+- Retrain each quarter, slide forward
+- Track portfolio value: x[i+1] = x[i] + (x[i] / num_stocks) * profit_i
 """
 
 import sys
@@ -11,116 +14,173 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import seaborn as sns
+from sklearn.metrics import confusion_matrix
 
-from data_prep import FEATURE_COLS, prepare_dataset, time_split
+from data_prep import FEATURE_COLS, prepare_dataset, rolling_window_splits
 from models import AccuracyModel, ProfitModel, SharpeModel
-from evaluation import full_evaluation
+from evaluation import compute_portfolio_value, sharpe_ratio, accuracy_metrics
 
 
 RESULTS_DIR = Path(__file__).resolve().parent.parent / "results"
+
+TRAIN_QUARTERS = 20  # 5 years
+
+
+def run_rolling_strategy(quarterly, model_class, model_kwargs, model_name):
+    """
+    Run a rolling window strategy:
+    - For each window, fit a fresh model and scaler on training data
+    - Predict on the next quarter
+    - Track predictions, actuals, and returns
+    """
+    all_preds = []
+    all_labels = []
+    quarterly_results = []
+
+    for train_df, test_df in rolling_window_splits(quarterly, TRAIN_QUARTERS):
+        X_train = train_df[FEATURE_COLS].values
+        y_train = train_df["label"].values
+        X_test = test_df[FEATURE_COLS].values
+        y_test = test_df["label"].values
+        test_returns = test_df["qtr_ret"].values
+        test_qtr = test_df["yq"].iloc[0]
+
+        # Instantiate and fit a fresh model each quarter
+        model = model_class(**model_kwargs)
+
+        if isinstance(model, ProfitModel):
+            model.fit(X_train, y_train, excess_ret=train_df["excess_ret"].values)
+        elif isinstance(model, SharpeModel):
+            model.fit(
+                X_train, y_train,
+                excess_ret=train_df["excess_ret"].values,
+                qtr_labels=train_df["yq"].values,
+            )
+        else:
+            model.fit(X_train, y_train)
+
+        preds = model.predict(X_test)
+        all_preds.extend(preds)
+        all_labels.extend(y_test)
+
+        quarterly_results.append({
+            "qtr": test_qtr,
+            "preds": preds,
+            "returns": test_returns,
+            "labels": y_test,
+        })
+
+    return np.array(all_preds), np.array(all_labels), quarterly_results
 
 
 def main(data_path=None):
     RESULTS_DIR.mkdir(exist_ok=True)
 
-    # --- Data preparation ---
     print("Loading and preparing data...")
     quarterly = prepare_dataset(data_path)
-    train, test = time_split(quarterly, test_start_year=2020)
 
-    print(f"Train: {len(train)} stock-quarters | Test: {len(test)} stock-quarters")
-    print(f"Label distribution (train):\n{train['label'].value_counts().sort_index()}\n")
-    print(f"Label distribution (test):\n{test['label'].value_counts().sort_index()}\n")
+    print(f"Total stock-quarters: {len(quarterly)}")
+    print(f"Label distribution:\n{quarterly['label'].value_counts().sort_index()}\n")
+    print(f"Rolling window: train on {TRAIN_QUARTERS} quarters, test on next quarter\n")
 
-    X_train = train[FEATURE_COLS].values
-    y_train = train["label"].values
-    X_test = test[FEATURE_COLS].values
-    y_test = test["label"].values
+    # Define models
+    model_configs = [
+        ("Accuracy-Optimized", AccuracyModel, {"C": 0.1}),
+        ("Profit-Optimized", ProfitModel, {"C": 0.1}),
+        ("Sharpe-Optimized", SharpeModel, {"alpha": 1.0}),
+    ]
 
-    # --- Train models ---
-    print("Training Accuracy Model (Logistic Regression)...")
-    acc_model = AccuracyModel(C=0.1)
-    acc_model.fit(X_train, y_train)
+    all_results = {}
 
-    print("Training Profit Model (Cost-sensitive LR)...")
-    profit_model = ProfitModel(C=0.1)
-    profit_model.fit(X_train, y_train, excess_ret=train["excess_ret"].values)
+    for name, model_class, kwargs in model_configs:
+        print(f"Running rolling strategy: {name}...")
+        preds, labels, qtr_results = run_rolling_strategy(
+            quarterly, model_class, kwargs, name
+        )
+        portfolio_values, qtr_profits = compute_portfolio_value(qtr_results)
+        sharpe = sharpe_ratio(portfolio_values)
+        accuracy = (preds == labels).mean()
+        total_return = portfolio_values[-1] - 1.0
 
-    print("Training Sharpe Model (Ridge → Sharpe-optimized thresholds)...")
-    sharpe_model = SharpeModel(alpha=1.0)
-    sharpe_model.fit(
-        X_train, y_train,
-        excess_ret=train["excess_ret"].values,
-        qtr_labels=train["yq"].values,
-    )
+        all_results[name] = {
+            "preds": preds,
+            "labels": labels,
+            "portfolio_values": portfolio_values,
+            "qtr_profits": qtr_profits,
+            "sharpe": sharpe,
+            "accuracy": accuracy,
+            "total_return": total_return,
+            "qtr_results": qtr_results,
+        }
 
-    # --- Evaluate ---
-    models = {
-        "Accuracy-Optimized": acc_model,
-        "Profit-Optimized": profit_model,
-        "Sharpe-Optimized": sharpe_model,
-    }
-
-    results = []
-    for name, model in models.items():
-        print(f"\nEvaluating {name}...")
-        preds = model.predict(X_test)
-        res = full_evaluation(name, y_test, preds, test["excess_ret"].values, test["yq"].values)
-        results.append(res)
-
-        print(f"  Accuracy:     {res['accuracy']:.4f}")
-        print(f"  Total Profit: {res['total_profit']:.4f}")
-        print(f"  Sharpe Ratio: {res['sharpe_ratio']:.4f}")
+        print(f"  Accuracy:       {accuracy:.4f}")
+        print(f"  Total Return:   {total_return:.4f} ({total_return*100:.1f}%)")
+        print(f"  Final Value:    {portfolio_values[-1]:.4f} (starting from 1.0)")
+        print(f"  Sharpe Ratio:   {sharpe:.4f}")
+        print()
 
     # --- Summary table ---
     summary = pd.DataFrame([
-        {"Model": r["model"], "Accuracy": r["accuracy"],
-         "Total Profit (Long-Short)": r["total_profit"],
-         "Sharpe Ratio (Annualized)": r["sharpe_ratio"]}
-        for r in results
+        {
+            "Model": name,
+            "Accuracy": r["accuracy"],
+            "Total Return": r["total_return"],
+            "Final Portfolio Value": r["portfolio_values"][-1],
+            "Sharpe Ratio (Annualized)": r["sharpe"],
+        }
+        for name, r in all_results.items()
     ])
-    print("\n" + "=" * 70)
+    print("=" * 70)
     print("SUMMARY")
     print("=" * 70)
     print(summary.to_string(index=False))
     summary.to_csv(RESULTS_DIR / "summary.csv", index=False)
 
     # --- Plots ---
-    _plot_quarterly_returns(results)
-    _plot_confusion_matrices(results)
+    _plot_portfolio_values(all_results)
+    _plot_confusion_matrices(all_results)
     _plot_summary_bars(summary)
 
     print(f"\nResults saved to {RESULTS_DIR}/")
 
 
-def _plot_quarterly_returns(results):
-    """Plot cumulative quarterly returns for each model."""
+def _plot_portfolio_values(all_results):
+    """Plot cumulative portfolio value for each model."""
     fig, ax = plt.subplots(figsize=(12, 6))
-    for res in results:
-        qr = res["quarterly_returns"].sort_values("qtr")
-        cum = (1 + qr["return"]).cumprod()
-        ax.plot(range(len(cum)), cum.values, label=res["model"], marker="o", markersize=3)
-        ax.set_xticks(range(len(cum)))
-        ax.set_xticklabels(qr["qtr"].values, rotation=45, ha="right", fontsize=7)
-    ax.set_ylabel("Cumulative Return (Long-Short)")
-    ax.set_title("Cumulative Long-Short Portfolio Returns by Model")
+    for name, res in all_results.items():
+        vals = res["portfolio_values"]
+        qtrs = res["qtr_profits"]["qtr"].tolist()
+        ax.plot(range(len(vals)), vals, label=name, marker="o", markersize=3)
+
+    # X-axis labels from the last model's quarters
+    last_res = list(all_results.values())[-1]
+    qtrs = ["Start"] + last_res["qtr_profits"]["qtr"].tolist()
+    step = max(1, len(qtrs) // 15)
+    ax.set_xticks(range(0, len(qtrs), step))
+    ax.set_xticklabels([qtrs[i] for i in range(0, len(qtrs), step)],
+                       rotation=45, ha="right", fontsize=7)
+
+    ax.set_ylabel("Portfolio Value")
+    ax.set_title("Rolling Window Strategy: Portfolio Value Over Time")
     ax.legend()
+    ax.axhline(y=1.0, color="gray", linestyle="--", alpha=0.5)
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
-    fig.savefig(RESULTS_DIR / "cumulative_returns.png", dpi=150)
+    fig.savefig(RESULTS_DIR / "portfolio_values.png", dpi=150)
     plt.close(fig)
 
 
-def _plot_confusion_matrices(results):
+def _plot_confusion_matrices(all_results):
     """Plot confusion matrices side by side."""
     fig, axes = plt.subplots(1, 3, figsize=(15, 4))
-    for ax, res in zip(axes, results):
+    for ax, (name, res) in zip(axes, all_results.items()):
+        cm = confusion_matrix(res["labels"], res["preds"], labels=[-1, 0, 1])
         sns.heatmap(
-            res["confusion_matrix"], annot=True, fmt="d", cmap="Blues",
+            cm, annot=True, fmt="d", cmap="Blues",
             xticklabels=["-1", "0", "+1"], yticklabels=["-1", "0", "+1"],
             ax=ax,
         )
-        ax.set_title(res["model"])
+        ax.set_title(name)
         ax.set_xlabel("Predicted")
         ax.set_ylabel("Actual")
     fig.tight_layout()
@@ -131,12 +191,12 @@ def _plot_confusion_matrices(results):
 def _plot_summary_bars(summary):
     """Bar chart comparing the three metrics across models."""
     fig, axes = plt.subplots(1, 3, figsize=(14, 5))
-    metrics = ["Accuracy", "Total Profit (Long-Short)", "Sharpe Ratio (Annualized)"]
+    metrics = ["Accuracy", "Total Return", "Sharpe Ratio (Annualized)"]
     colors = ["#2196F3", "#4CAF50", "#FF9800"]
     for ax, metric, color in zip(axes, metrics, colors):
-        ax.bar(summary["Model"], summary[metric], color=color, alpha=0.8)
+        bars = ax.bar(summary["Model"], summary[metric], color=color, alpha=0.8)
         ax.set_title(metric)
-        ax.set_xticklabels(summary["Model"], rotation=20, ha="right", fontsize=8)
+        ax.tick_params(axis="x", rotation=20, labelsize=8)
         ax.grid(axis="y", alpha=0.3)
     fig.tight_layout()
     fig.savefig(RESULTS_DIR / "metric_comparison.png", dpi=150)

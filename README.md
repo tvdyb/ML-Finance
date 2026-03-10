@@ -1,6 +1,6 @@
 # ML-Finance: Stock Classification with Linear Models
 
-Quarterly stock classification relative to the S&P 500 using three linear models, each optimizing a different objective.
+Quarterly stock classification relative to the S&P 500 using three linear models, each optimizing a different objective. Uses a rolling window train/test methodology.
 
 ## Classification Labels
 
@@ -11,6 +11,20 @@ Each stock-quarter is labeled based on its excess return over the S&P 500 (proxi
 | **+1** (Beat) | Excess return > +2% |
 | **0** (Neutral) | Excess return between -2% and +2% |
 | **-1** (Miss) | Excess return < -2% |
+
+## Rolling Window Strategy
+
+Following the course methodology:
+- **Training window**: 20 quarters (5 years)
+- **Test window**: the next quarter
+- The model is **retrained each quarter** with a fresh scaler
+- Slide forward by 1 quarter and repeat
+
+Portfolio value is tracked as:
+```
+profit_i = (predictions * stock_returns).sum()
+x[i+1] = x[i] + (x[i] / num_stocks) * profit_i
+```
 
 ## Models
 
@@ -25,7 +39,7 @@ Two-stage model: Ridge regression predicts excess returns, then classification t
 
 ## Data
 
-Panel of ~5,000 large-cap US stocks with 45 fundamental/valuation features (2012–2022). Monthly data is compounded to quarterly returns.
+Panel of ~5,000 large-cap US stocks with 45 fundamental/valuation features (2012-2022). Monthly data is compounded to quarterly returns.
 
 **Features include:** valuation ratios (P/E, P/B, P/S, P/CF), profitability (ROA, ROE, margins), leverage (debt ratios, interest coverage), liquidity (current/quick ratio), and efficiency (asset/inventory turnover).
 
@@ -46,15 +60,11 @@ Results (summary CSV + plots) are saved to `results/`.
 ```
 ├── data/                  # CSV data (git-ignored)
 ├── src/
-│   ├── data_prep.py       # Loading, quarterly aggregation, labeling
+│   ├── data_prep.py       # Loading, quarterly aggregation, labeling, rolling splits
 │   ├── models.py          # Three linear model classes
-│   ├── evaluation.py      # Accuracy, profit, Sharpe evaluation
-│   └── run_pipeline.py    # Main entry point
+│   ├── evaluation.py      # Portfolio tracking, Sharpe, accuracy
+│   └── run_pipeline.py    # Main entry point (rolling window strategy)
 ├── results/               # Output plots and summary (git-ignored)
 ├── requirements.txt
 └── README.md
 ```
-
-## Train/Test Split
-
-Time-based split: train on 2012–2019, test on 2020–2022. No look-ahead bias.

@@ -1,6 +1,6 @@
 """
 Data preparation: load panel data, compute quarterly S&P-relative labels,
-and produce train/test splits respecting time ordering.
+and produce rolling window train/test splits (matching course methodology).
 """
 
 import pandas as pd
@@ -40,7 +40,6 @@ def compute_quarterly_return(df: pd.DataFrame) -> pd.DataFrame:
     df["quarter"] = df["public_date"].dt.quarter
     df["yq"] = df["year"].astype(str) + "Q" + df["quarter"].astype(str)
 
-    # Compound monthly returns within each stock-quarter
     def compound(rets):
         return (1 + rets).prod() - 1
 
@@ -82,29 +81,48 @@ def assign_labels(quarterly: pd.DataFrame, threshold: float = 0.02) -> pd.DataFr
 
 
 def prepare_dataset(path: str | Path | None = None, threshold: float = 0.02):
-    """Full pipeline: load → quarterly aggregation → labels → clean features."""
+    """Full pipeline: load -> quarterly aggregation -> labels -> clean features."""
     df = load_data(path)
     quarterly = compute_quarterly_return(df)
     quarterly = compute_sp_benchmark(quarterly)
     quarterly = assign_labels(quarterly, threshold)
 
-    # Drop rows with missing features
-    quarterly = quarterly.dropna(subset=FEATURE_COLS)
-
-    # Replace infinities
+    # Replace infinities then drop rows with missing features
     quarterly[FEATURE_COLS] = quarterly[FEATURE_COLS].replace(
         [np.inf, -np.inf], np.nan
     )
     quarterly = quarterly.dropna(subset=FEATURE_COLS)
+    quarterly = quarterly.fillna(0)
+
+    # Sort by time for rolling window
+    quarterly = quarterly.sort_values("public_date_first").reset_index(drop=True)
 
     return quarterly
 
 
-def time_split(quarterly: pd.DataFrame, test_start_year: int = 2020):
+def get_sorted_quarters(quarterly: pd.DataFrame) -> list:
+    """Return sorted list of unique quarter labels."""
+    qtr_dates = quarterly.groupby("yq")["public_date_first"].first().sort_values()
+    return list(qtr_dates.index)
+
+
+def rolling_window_splits(quarterly: pd.DataFrame, train_quarters: int = 20):
     """
-    Split into train/test respecting time: everything before test_start_year
-    is training, the rest is test.
+    Generate rolling window train/test splits matching the course methodology:
+    - Train on `train_quarters` quarters (default 20 = 5 years)
+    - Test on the next quarter
+    - Slide forward by 1 quarter and repeat
+
+    Yields (train_df, test_df) tuples.
     """
-    train = quarterly[quarterly["year"] < test_start_year].copy()
-    test = quarterly[quarterly["year"] >= test_start_year].copy()
-    return train, test
+    quarters = get_sorted_quarters(quarterly)
+
+    for i in range(train_quarters, len(quarters)):
+        train_qtrs = quarters[i - train_quarters:i]
+        test_qtr = quarters[i]
+
+        train_df = quarterly[quarterly["yq"].isin(train_qtrs)]
+        test_df = quarterly[quarterly["yq"] == test_qtr]
+
+        if len(train_df) > 0 and len(test_df) > 0:
+            yield train_df, test_df
