@@ -106,19 +106,22 @@ def get_sorted_quarters(quarterly: pd.DataFrame) -> list:
     return list(qtr_dates.index)
 
 
-def rolling_window_splits(quarterly: pd.DataFrame, train_quarters: int = 20):
+def rolling_window_splits(quarterly: pd.DataFrame, train_quarters: int = 20,
+                          embargo: int = 1):
     """
-    Generate rolling window train/test splits matching the course methodology:
-    - Train on `train_quarters` quarters (default 20 = 5 years)
-    - Test on the next quarter
+    Generate rolling window train/test splits:
+    - Train on `train_quarters` quarters
+    - Skip `embargo` quarters (default 1) to prevent information leakage
+      from trailing features (e.g. trailing P/E, rolling averages)
+    - Test on the next quarter after the embargo gap
     - Slide forward by 1 quarter and repeat
 
     Yields (train_df, test_df) tuples.
     """
     quarters = get_sorted_quarters(quarterly)
 
-    for i in range(train_quarters, len(quarters)):
-        train_qtrs = quarters[i - train_quarters:i]
+    for i in range(train_quarters + embargo, len(quarters)):
+        train_qtrs = quarters[i - train_quarters - embargo:i - embargo]
         test_qtr = quarters[i]
 
         train_df = quarterly[quarterly["yq"].isin(train_qtrs)]

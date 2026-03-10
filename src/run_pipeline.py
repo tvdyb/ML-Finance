@@ -2,6 +2,7 @@
 Main pipeline using rolling window train/test splits (course methodology):
 - Train on 20 quarters (5 years), test on the next quarter
 - Retrain each quarter, slide forward
+- Per-quarter hyperparameter tuning via expanding-window temporal CV
 - Track portfolio value: x[i+1] = x[i] + (x[i] / num_stocks) * profit_i
 """
 
@@ -19,6 +20,7 @@ from sklearn.metrics import confusion_matrix
 from data_prep import FEATURE_COLS, prepare_dataset, rolling_window_splits
 from models import AccuracyModel, ProfitModel, SharpeModel
 from evaluation import compute_portfolio_value, sharpe_ratio, accuracy_metrics
+from tuning import tune_and_fit
 
 
 RESULTS_DIR = Path(__file__).resolve().parent.parent / "results"
@@ -26,47 +28,39 @@ RESULTS_DIR = Path(__file__).resolve().parent.parent / "results"
 TRAIN_QUARTERS = 20  # 5 years
 
 
-def run_rolling_strategy(quarterly, model_class, model_kwargs, model_name):
+def run_rolling_strategy(quarterly, model_class, model_name):
     """
-    Run a rolling window strategy:
-    - For each window, fit a fresh model and scaler on training data
-    - Predict on the next quarter
-    - Track predictions, actuals, and returns
+    Run a rolling window strategy with per-quarter hyperparameter tuning:
+    - For each window, tune regularization via expanding-window temporal CV
+    - Fit final model on full training window with best param
+    - Predict on the test quarter
     """
     all_preds = []
     all_labels = []
     quarterly_results = []
 
     for train_df, test_df in rolling_window_splits(quarterly, TRAIN_QUARTERS):
-        X_train = train_df[FEATURE_COLS].values
-        y_train = train_df["label"].values
         X_test = test_df[FEATURE_COLS].values
         y_test = test_df["label"].values
-        test_returns = test_df["qtr_ret"].values
         test_qtr = test_df["yq"].iloc[0]
 
-        # Instantiate and fit a fresh model each quarter
-        model = model_class(**model_kwargs)
-
-        if isinstance(model, ProfitModel):
-            model.fit(X_train, y_train, excess_ret=train_df["excess_ret"].values)
-        elif isinstance(model, SharpeModel):
-            model.fit(
-                X_train, y_train,
-                excess_ret=train_df["excess_ret"].values,
-                qtr_labels=train_df["yq"].values,
-            )
-        else:
-            model.fit(X_train, y_train)
+        # Tune hyperparameters and fit final model
+        model, best_param, param_name = tune_and_fit(model_class, train_df)
 
         preds = model.predict(X_test)
+        n_long = (preds == 1).sum()
+        n_short = (preds == -1).sum()
+        n_total = len(preds)
+        print(f"    {test_qtr}: {n_long} long, {n_short} short, "
+              f"{n_long + n_short} active / {n_total} total  "
+              f"(best {param_name}={best_param})")
         all_preds.extend(preds)
         all_labels.extend(y_test)
 
         quarterly_results.append({
             "qtr": test_qtr,
             "preds": preds,
-            "returns": test_returns,
+            "excess_ret": test_df["excess_ret"].values,
             "labels": y_test,
         })
 
@@ -83,22 +77,22 @@ def main(data_path=None):
     print(f"Label distribution:\n{quarterly['label'].value_counts().sort_index()}\n")
     print(f"Rolling window: train on {TRAIN_QUARTERS} quarters, test on next quarter\n")
 
-    # Define models
+    # Define models (regularization is tuned per quarter via expanding-window CV)
     model_configs = [
-        ("Accuracy-Optimized", AccuracyModel, {"C": 0.1}),
-        ("Profit-Optimized", ProfitModel, {"C": 0.1}),
-        ("Sharpe-Optimized", SharpeModel, {"alpha": 1.0}),
+        ("Accuracy-Optimized", AccuracyModel),
+        ("Profit-Optimized", ProfitModel),
+        ("Sharpe-Optimized", SharpeModel),
     ]
 
     all_results = {}
 
-    for name, model_class, kwargs in model_configs:
+    for name, model_class in model_configs:
         print(f"Running rolling strategy: {name}...")
         preds, labels, qtr_results = run_rolling_strategy(
-            quarterly, model_class, kwargs, name
+            quarterly, model_class, name
         )
         portfolio_values, qtr_profits = compute_portfolio_value(qtr_results)
-        sharpe = sharpe_ratio(portfolio_values)
+        sharpe = sharpe_ratio(qtr_profits["qtr_return"])
         accuracy = (preds == labels).mean()
         total_return = portfolio_values[-1] - 1.0
 
@@ -149,7 +143,6 @@ def _plot_portfolio_values(all_results):
     fig, ax = plt.subplots(figsize=(12, 6))
     for name, res in all_results.items():
         vals = res["portfolio_values"]
-        qtrs = res["qtr_profits"]["qtr"].tolist()
         ax.plot(range(len(vals)), vals, label=name, marker="o", markersize=3)
 
     # X-axis labels from the last model's quarters
@@ -194,7 +187,7 @@ def _plot_summary_bars(summary):
     metrics = ["Accuracy", "Total Return", "Sharpe Ratio (Annualized)"]
     colors = ["#2196F3", "#4CAF50", "#FF9800"]
     for ax, metric, color in zip(axes, metrics, colors):
-        bars = ax.bar(summary["Model"], summary[metric], color=color, alpha=0.8)
+        ax.bar(summary["Model"], summary[metric], color=color, alpha=0.8)
         ax.set_title(metric)
         ax.tick_params(axis="x", rotation=20, labelsize=8)
         ax.grid(axis="y", alpha=0.3)

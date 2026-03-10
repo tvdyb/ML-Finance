@@ -4,7 +4,7 @@ Three linear models with different optimization objectives:
 2. ProfitModel    - logistic regression with sample weights proportional to
                     |excess return| to tilt toward profit-relevant predictions
 3. SharpeModel    - Ridge regression predicting excess returns, with thresholds
-                    tuned to maximize Sharpe ratio of a long-short portfolio
+                    tuned on a held-out calibration set to maximize Sharpe ratio
 """
 
 import numpy as np
@@ -32,7 +32,7 @@ class AccuracyModel:
         X_scaled = self.scaler.fit_transform(X)
         self.clf = LogisticRegression(
             C=self.C, max_iter=self.max_iter,
-            solver="lbfgs", class_weight="balanced",
+            solver="lbfgs",
         )
         self.clf.fit(X_scaled, y)
         return self
@@ -79,14 +79,22 @@ class ProfitModel:
 
 
 # ---------------------------------------------------------------------------
-# 3. Sharpe-optimized: Ridge regression + threshold tuning
+# 3. Sharpe-optimized: Ridge regression + threshold tuning on held-out cal set
 # ---------------------------------------------------------------------------
 
 class SharpeModel:
     """
     Ridge regression to predict excess returns, then classification
-    thresholds are optimized to maximize the realized Sharpe ratio
-    of a long-short portfolio on training data.
+    thresholds are optimized on a held-out calibration set (last ~25%
+    of training quarters) to avoid in-sample overfitting of thresholds.
+
+    Fit procedure:
+    1. Split training quarters into fit (first ~75%) and calibration (~25%)
+    2. Fit Ridge on fit portion only
+    3. Predict on calibration portion (OOS predictions)
+    4. Optimize long/short thresholds on calibration via Nelder-Mead
+    5. Refit Ridge on the FULL training set (so OOS predictions use all data)
+    6. Keep thresholds from step 4
     """
 
     def __init__(self, alpha=1.0):
@@ -100,16 +108,44 @@ class SharpeModel:
         if excess_ret is None:
             raise ValueError("SharpeModel requires excess_ret for training")
 
+        if qtr_labels is not None:
+            # Split into fit (75%) and calibration (25%) by quarter
+            unique_qtrs = sorted(set(qtr_labels))
+            n_fit = max(1, int(len(unique_qtrs) * 0.75))
+            fit_qtrs = set(unique_qtrs[:n_fit])
+            cal_qtrs = set(unique_qtrs[n_fit:])
+
+            fit_mask = np.array([q in fit_qtrs for q in qtr_labels])
+            cal_mask = np.array([q in cal_qtrs for q in qtr_labels])
+
+            if cal_mask.sum() > 0:
+                # Step 1-2: Fit Ridge on fit portion only
+                fit_scaler = StandardScaler()
+                X_fit_scaled = fit_scaler.fit_transform(X[fit_mask])
+                fit_ridge = Ridge(alpha=self.alpha)
+                fit_ridge.fit(X_fit_scaled, excess_ret[fit_mask])
+
+                # Step 3: Predict on calibration portion (OOS)
+                X_cal_scaled = fit_scaler.transform(X[cal_mask])
+                cal_scores = fit_ridge.predict(X_cal_scaled)
+
+                # Step 4: Optimize thresholds on calibration predictions
+                self._optimize_thresholds(
+                    cal_scores, excess_ret[cal_mask], qtr_labels[cal_mask]
+                )
+            else:
+                # Fallback if not enough quarters for calibration
+                self.long_thresh = 0.0
+                self.short_thresh = 0.0
+
+        # Step 5: Refit Ridge on the FULL training set
         self.scaler = StandardScaler()
         X_scaled = self.scaler.fit_transform(X)
         self.ridge = Ridge(alpha=self.alpha)
         self.ridge.fit(X_scaled, excess_ret)
-        scores = self.ridge.predict(X_scaled)
 
-        if qtr_labels is not None:
-            self._optimize_thresholds(scores, excess_ret, qtr_labels)
-        else:
-            std = np.std(scores)
+        if qtr_labels is None:
+            std = np.std(self.ridge.predict(X_scaled))
             self.long_thresh = 0.5 * std
             self.short_thresh = -0.5 * std
 

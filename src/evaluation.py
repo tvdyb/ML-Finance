@@ -27,36 +27,34 @@ def compute_portfolio_value(quarterly_results):
     """
     Compute cumulative portfolio value from quarterly predictions,
     matching the course formula:
-        profit_i = (preds * next_period_return).sum()
+        profit_i = (preds * excess_ret).sum()
         x[i+1] = x[i] + (x[i] / num_stocks) * profit_i
 
-    quarterly_results: list of dicts with keys 'preds', 'returns', 'qtr'
+    quarterly_results: list of dicts with keys 'preds', 'excess_ret', 'qtr'
     Returns list of portfolio values starting at 1.0
     """
     x = [1.0]
     qtr_profits = []
     for qr in quarterly_results:
         preds = qr["preds"]
-        returns = qr["returns"]
-        num_stocks = len(preds)
+        excess_ret = qr["excess_ret"]
+        num_stocks = np.count_nonzero(preds) or len(preds)
 
-        profit_i = (preds * returns).sum()
-        qtr_profits.append({"qtr": qr["qtr"], "profit": profit_i, "num_stocks": num_stocks})
+        profit_i = (preds * excess_ret).sum()
+        qtr_return = profit_i / num_stocks
+        qtr_profits.append({"qtr": qr["qtr"], "profit": profit_i, "num_stocks": num_stocks, "qtr_return": qtr_return})
 
         x.append(x[-1] + (x[-1] / num_stocks) * profit_i)
 
     return x, pd.DataFrame(qtr_profits)
 
 
-def sharpe_ratio(portfolio_values, annualize=True):
-    """Compute Sharpe ratio from portfolio value series."""
-    x = np.array(portfolio_values)
-    if len(x) < 3:
+def sharpe_ratio(qtr_returns, annualize=True):
+    """Compute Sharpe ratio from per-quarter strategy returns."""
+    r = np.array(qtr_returns)
+    if len(r) < 2:
         return 0.0
-    returns = np.diff(x) / x[:-1]
-    mean_ret = returns.mean()
-    std_ret = returns.std()
-    sharpe = mean_ret / (std_ret + 1e-8)
+    sharpe = r.mean() / (r.std() + 1e-8)
     if annualize:
         sharpe *= np.sqrt(4)  # quarterly -> annual
     return sharpe
