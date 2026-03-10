@@ -1,7 +1,7 @@
 """
-Evaluation utilities matching the course methodology:
-- Profit: sum of (prediction * next_period_return) per quarter
-- Portfolio tracking: x[i+1] = x[i] + (x[i] / num_stocks) * profit_i
+Evaluation utilities:
+- Long-short portfolio: (mean_long_excess - mean_short_excess) / 2
+- Portfolio tracking from quarterly returns
 - Sharpe ratio from quarterly portfolio returns
 - Classification accuracy
 """
@@ -25,26 +25,46 @@ def accuracy_metrics(y_true, y_pred):
 
 def compute_portfolio_value(quarterly_results):
     """
-    Compute cumulative portfolio value from quarterly predictions,
-    matching the course formula:
-        profit_i = (preds * excess_ret).sum()
-        x[i+1] = x[i] + (x[i] / num_stocks) * profit_i
+    Compute cumulative portfolio value using standard long-short construction:
+        qtr_return = (mean_long_excess - mean_short_excess) / 2
+        x[i+1] = x[i] * (1 + qtr_return)
+
+    Each side (long/short) gets equal capital. Per-position edge matters,
+    not number of positions. Neutral predictions are ignored.
 
     quarterly_results: list of dicts with keys 'preds', 'excess_ret', 'qtr'
     Returns list of portfolio values starting at 1.0
     """
+    # Winsorize excess returns at 1st/99th percentile
+    all_excess = np.concatenate([qr["excess_ret"] for qr in quarterly_results])
+    lo, hi = np.percentile(all_excess, 1), np.percentile(all_excess, 99)
+
     x = [1.0]
     qtr_profits = []
     for qr in quarterly_results:
         preds = qr["preds"]
-        excess_ret = qr["excess_ret"]
-        num_stocks = np.count_nonzero(preds) or len(preds)
+        excess_ret = np.clip(qr["excess_ret"], lo, hi)
 
-        profit_i = (preds * excess_ret).sum()
-        qtr_return = profit_i / num_stocks
-        qtr_profits.append({"qtr": qr["qtr"], "profit": profit_i, "num_stocks": num_stocks, "qtr_return": qtr_return})
+        long_mask = preds == 1
+        short_mask = preds == -1
 
-        x.append(x[-1] + (x[-1] / num_stocks) * profit_i)
+        # Long side: mean excess return of stocks predicted +1
+        long_ret = excess_ret[long_mask].mean() if long_mask.sum() > 0 else 0.0
+        # Short side: we profit from the negative of shorts' excess return
+        short_ret = -excess_ret[short_mask].mean() if short_mask.sum() > 0 else 0.0
+
+        # Equal capital each side
+        n_sides = (long_mask.sum() > 0) + (short_mask.sum() > 0)
+        qtr_return = (long_ret + short_ret) / max(n_sides, 1)
+
+        qtr_profits.append({
+            "qtr": qr["qtr"],
+            "qtr_return": qtr_return,
+            "n_long": int(long_mask.sum()),
+            "n_short": int(short_mask.sum()),
+        })
+
+        x.append(x[-1] * (1 + qtr_return))
 
     return x, pd.DataFrame(qtr_profits)
 

@@ -9,9 +9,9 @@ Three linear models with different optimization objectives:
 
 import numpy as np
 import pandas as pd
+from itertools import product
 from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.preprocessing import StandardScaler
-from scipy.optimize import minimize
 
 
 # ---------------------------------------------------------------------------
@@ -32,7 +32,7 @@ class AccuracyModel:
         X_scaled = self.scaler.fit_transform(X)
         self.clf = LogisticRegression(
             C=self.C, max_iter=self.max_iter,
-            solver="lbfgs",
+            solver="lbfgs", class_weight="balanced",
         )
         self.clf.fit(X_scaled, y)
         return self
@@ -79,20 +79,24 @@ class ProfitModel:
 
 
 # ---------------------------------------------------------------------------
-# 3. Sharpe-optimized: Ridge regression + threshold tuning on held-out cal set
+# 3. Sharpe-optimized: Ridge regression + grid-search threshold tuning
+#    on held-out calibration set
 # ---------------------------------------------------------------------------
+
+THRESHOLD_MULTIPLIERS = [0.1, 0.25, 0.5, 0.75, 1.0, 1.5]
+
 
 class SharpeModel:
     """
     Ridge regression to predict excess returns, then classification
-    thresholds are optimized on a held-out calibration set (last ~25%
-    of training quarters) to avoid in-sample overfitting of thresholds.
+    thresholds are optimized on a held-out calibration set (last ~40%
+    of training quarters) via discrete grid search.
 
     Fit procedure:
-    1. Split training quarters into fit (first ~75%) and calibration (~25%)
+    1. Split training quarters into fit (first ~60%) and calibration (~40%)
     2. Fit Ridge on fit portion only
     3. Predict on calibration portion (OOS predictions)
-    4. Optimize long/short thresholds on calibration via Nelder-Mead
+    4. Grid search long/short thresholds on calibration predictions
     5. Refit Ridge on the FULL training set (so OOS predictions use all data)
     6. Keep thresholds from step 4
     """
@@ -109,14 +113,13 @@ class SharpeModel:
             raise ValueError("SharpeModel requires excess_ret for training")
 
         if qtr_labels is not None:
-            # Split into fit (75%) and calibration (25%) by quarter
+            # Split into fit (60%) and calibration (40%) by quarter
             unique_qtrs = sorted(set(qtr_labels))
-            n_fit = max(1, int(len(unique_qtrs) * 0.75))
+            n_fit = max(1, int(len(unique_qtrs) * 0.60))
             fit_qtrs = set(unique_qtrs[:n_fit])
-            cal_qtrs = set(unique_qtrs[n_fit:])
 
             fit_mask = np.array([q in fit_qtrs for q in qtr_labels])
-            cal_mask = np.array([q in cal_qtrs for q in qtr_labels])
+            cal_mask = ~fit_mask
 
             if cal_mask.sum() > 0:
                 # Step 1-2: Fit Ridge on fit portion only
@@ -129,12 +132,11 @@ class SharpeModel:
                 X_cal_scaled = fit_scaler.transform(X[cal_mask])
                 cal_scores = fit_ridge.predict(X_cal_scaled)
 
-                # Step 4: Optimize thresholds on calibration predictions
-                self._optimize_thresholds(
+                # Step 4: Grid search thresholds on calibration predictions
+                self._grid_search_thresholds(
                     cal_scores, excess_ret[cal_mask], qtr_labels[cal_mask]
                 )
             else:
-                # Fallback if not enough quarters for calibration
                 self.long_thresh = 0.0
                 self.short_thresh = 0.0
 
@@ -151,15 +153,23 @@ class SharpeModel:
 
         return self
 
-    def _optimize_thresholds(self, scores, excess_ret, qtr_labels):
+    def _grid_search_thresholds(self, scores, excess_ret, qtr_labels):
+        """Grid search over discrete threshold pairs on calibration data."""
+        std = np.std(scores)
+        long_candidates = [m * std for m in THRESHOLD_MULTIPLIERS]
+        short_candidates = [-m * std for m in THRESHOLD_MULTIPLIERS]
+
         df = pd.DataFrame({
             "score": scores,
             "excess_ret": excess_ret,
             "qtr": qtr_labels,
         })
 
-        def neg_sharpe(params):
-            long_t, short_t = params[0], -abs(params[1])
+        best_sharpe = -np.inf
+        best_long = 0.5 * std
+        best_short = -0.5 * std
+
+        for long_t, short_t in product(long_candidates, short_candidates):
             port_rets = []
             for _, grp in df.groupby("qtr"):
                 longs = grp[grp["score"] > long_t]["excess_ret"]
@@ -174,21 +184,19 @@ class SharpeModel:
                     n += 1
                 if n > 0:
                     port_rets.append(ret / n)
+
             if len(port_rets) < 2:
-                return 0.0
+                continue
+
             port_rets = np.array(port_rets)
             sharpe = port_rets.mean() / (port_rets.std() + 1e-8)
-            return -sharpe
+            if sharpe > best_sharpe:
+                best_sharpe = sharpe
+                best_long = long_t
+                best_short = short_t
 
-        std = np.std(scores)
-        result = minimize(
-            neg_sharpe,
-            x0=[0.5 * std, 0.5 * std],
-            method="Nelder-Mead",
-            options={"maxiter": 500},
-        )
-        self.long_thresh = result.x[0]
-        self.short_thresh = -abs(result.x[1])
+        self.long_thresh = best_long
+        self.short_thresh = best_short
 
     def predict(self, X):
         X_scaled = self.scaler.transform(X)

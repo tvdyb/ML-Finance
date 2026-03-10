@@ -10,7 +10,7 @@ CV scheme (given 20 training quarters, min_train=12):
 Each model type uses a different objective metric:
   AccuracyModel: classification accuracy
   ProfitModel:   realized profit = (preds * excess_ret).sum()
-  SharpeModel:   mean(fold_profits) / std(fold_profits) across all folds
+  SharpeModel:   mean(fold_profits) — more stable than Sharpe proxy with 8 folds
 """
 
 import numpy as np
@@ -91,9 +91,8 @@ def _cv_score(model_class, param_name, param_value, train_df, sorted_qtrs):
         return -np.inf
 
     if issubclass(model_class, SharpeModel):
-        # Sharpe proxy: mean / std of per-fold profits
-        profits = np.array(fold_profits)
-        return profits.mean() / (profits.std() + 1e-8)
+        # Use mean profit instead of Sharpe proxy — more stable with 8 folds
+        return np.mean(fold_profits)
     else:
         # AccuracyModel: average accuracy; ProfitModel: average profit
         return np.mean(fold_metrics)
